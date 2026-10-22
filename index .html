@@ -532,38 +532,153 @@ let net = null;         // partida online activa | null
 const RANK_LABEL = { novato: 'NOVATO', noob: 'NOOB', pro: 'PRO', hacker: 'HACKER' };
 const RANK_ICON  = { novato: '⚪', noob: '🟡', pro: '🟠', hacker: '🔴' };
 
+// ============================================================
+//  NETCODE LOCKSTEP DETERMINISTA
+//  Ambos navegadores simulan EXACTAMENTE los mismos frames con
+//  EXACTAMENTE los mismos inputs. Cada input viaja etiquetado con el
+//  número de frame en el que se aplicará (frame actual + delay), así
+//  nunca se aplica "tarde" ni en un frame distinto en cada cliente.
+//  Si el input del rival de un frame aún no llegó, la simulación
+//  espera (stall) en vez de adelantarse y desincronizarse.
+// ============================================================
+const STEP_MS = 1000 / 60; // paso fijo de simulación: 60 pasos/s en cualquier monitor
+// bits 1..32 = teclas sostenidas | bits 64+ = acciones de una sola pulsación
+const ACT = { ki: 64, ult: 128, fly: 256, awaken: 512, dashL: 1024, dashR: 2048 };
+const ONLINE_KEYS = {
+    p1: { left: 'KeyA', right: 'KeyD', up: 'KeyW', down: 'KeyS', charge: 'KeyC', attack: 'KeyF', ki: 'KeyE', ult: 'KeyQ', fly: 'KeyR', awaken: 'KeyT' },
+    p2: { left: 'ArrowLeft', right: 'ArrowRight', up: 'ArrowUp', down: 'ArrowDown', charge: 'KeyI', attack: 'KeyK', ki: 'KeyL', ult: 'KeyU', fly: 'KeyO', awaken: 'KeyP' },
+};
+
 const isOnline = () => gameMode === 'online' && net && net.ws && net.ws.readyState === 1;
-const isRemote = (side) => isOnline() && net.mySide === (side === 1 ? 'p2' : 'p1');
 
 function tryGetToken() { try { return localStorage.getItem(LS_STORAGE.token) || ''; } catch (e) { return ''; } }
 function netSend(obj) { if (net && net.ws && net.ws.readyState === 1) net.ws.send(JSON.stringify(obj)); }
 
-// Envía el bitmask de teclas sostenidas de MI personaje (host = layout J1, invitado = J2).
-function sendIn() {
-    if (!isOnline()) return;
-    let m = 0;
-    if (net.mySide === 'p1') {
-        if (keys['KeyA']) m |= 1;
-        if (keys['KeyD']) m |= 2;
-        if (keys['KeyW']) m |= 4;
-        if (keys['KeyS']) m |= 8;
-        if (keys['KeyC']) m |= 16;
-        if (keys['KeyF']) m |= 32;
-    } else {
-        if (keys['ArrowLeft']) m |= 1;
-        if (keys['ArrowRight']) m |= 2;
-        if (keys['ArrowUp']) m |= 4;
-        if (keys['ArrowDown']) m |= 8;
-        if (keys['KeyI']) m |= 16;
-        if (keys['KeyK']) m |= 32;
+function setNetInfo(txt, warn) {
+    let el = document.getElementById('net-info');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'net-info';
+        el.style.cssText = 'position:fixed;top:6px;right:8px;z-index:60;font:bold 12px monospace;background:rgba(0,0,0,.6);padding:3px 8px;border-radius:4px;pointer-events:none;display:none;';
+        document.body.appendChild(el);
     }
-    if (m !== net.lastSentMask) { net.lastSentMask = m; netSend({ t: 'in', m }); }
+    el.style.display = txt ? 'block' : 'none';
+    el.style.color = warn ? '#ff8888' : '#7CFC00';
+    el.textContent = txt || '';
 }
-function sendAct(a) { if (isOnline()) netSend({ t: 'act', a }); }
+function netIdleInfo() {
+    if (net && gameMode === 'online' && gameRunning) setNetInfo('PING ' + Math.round(net.rtt || 0) + ' ms · DELAY ' + net.delay + 'f', false);
+}
 
-// Aplica los inputs del rival al fighter remoto (mismo patrón que el bot).
-function applyRemoteTo(fighter) {
-    const m = net.remoteHeld;
+// Mide la latencia con el servidor (se usa para calcular el delay de inputs).
+function startPing() {
+    const p = () => netSend({ t: 'ping', ts: performance.now() });
+    p(); setTimeout(p, 250); setTimeout(p, 500);
+    net.pingTimer = setInterval(p, 2000);
+}
+
+// Máscara de teclas sostenidas de MI personaje (J1 = WASD…, J2 = flechas…)
+function localHeldMask() {
+    const k = ONLINE_KEYS[net.mySide];
+    let m = 0;
+    if (keys[k.left]) m |= 1;
+    if (keys[k.right]) m |= 2;
+    if (keys[k.up]) m |= 4;
+    if (keys[k.down]) m |= 8;
+    if (keys[k.charge]) m |= 16;
+    if (keys[k.attack]) m |= 32;
+    return m;
+}
+
+// Pulsaciones puntuales (disparo, vuelo, dash…): se acumulan hasta el siguiente frame de envío.
+function queueOnlineKey(code) {
+    const k = ONLINE_KEYS[net.mySide];
+    if (code === k.ki) net.pendingActs |= ACT.ki;
+    else if (code === k.ult) net.pendingActs |= ACT.ult;
+    else if (code === k.fly) net.pendingActs |= ACT.fly;
+    else if (code === k.awaken) net.pendingActs |= ACT.awaken;
+    else if (code === k.left || code === k.right) {
+        const now = Date.now();
+        if (net.lastTap.key === code && now - net.lastTap.time < 220) net.pendingActs |= (code === k.left ? ACT.dashL : ACT.dashR);
+        net.lastTap = { key: code, time: now };
+    }
+}
+
+// Al empezar la partida: los primeros `delay` frames son "vacíos" y se envían explícitamente.
+function onlineBeginSim() {
+    net.frame = 0; net.pendingActs = 0; net.stallSince = 0;
+    net.localIn.clear(); net.myHash.clear();
+    for (let f = 0; f < net.delay; f++) { net.localIn.set(f, 0); netSend({ t: 'in', f, m: 0 }); }
+    net.nextSend = net.delay;
+}
+
+// Devuelve los inputs de ESTE frame para ambos jugadores, o null si hay que esperar al rival.
+function onlineFrameInputs() {
+    if (net.nextSend === net.frame + net.delay) {
+        const m = localHeldMask() | net.pendingActs;
+        net.pendingActs = 0;
+        net.localIn.set(net.nextSend, m);
+        netSend({ t: 'in', f: net.nextSend, m });
+        net.nextSend++;
+    }
+    const f = net.frame;
+    const mine = net.localIn.get(f), theirs = net.remoteIn.get(f);
+    if (mine === undefined || theirs === undefined) {
+        const now = performance.now();
+        if (!net.stallSince) net.stallSince = now;
+        const waited = now - net.stallSince;
+        if (waited > 200) setNetInfo('Esperando al rival… ' + Math.floor(waited / 1000) + 's', true);
+        if (waited > 12000) {
+            endOnlineAborted('RIVAL SIN RESPUESTA — PARTIDA ANULADA');
+            try { netSend({ t: 'leave' }); } catch (e) {}
+        }
+        return null;
+    }
+    if (net.stallSince) { net.stallSince = 0; netIdleInfo(); }
+    net.localIn.delete(f); net.remoteIn.delete(f);
+    return net.mySide === 'p1' ? { m1: mine, m2: theirs } : { m1: theirs, m2: mine };
+}
+
+// Hash del estado del juego: ambos clientes lo comparan para detectar desincronización.
+function stateHash() {
+    let h = 2166136261 >>> 0;
+    const add = (v) => { h = Math.imul(h ^ (Math.round(v * 1000) | 0), 16777619) >>> 0; };
+    [player1, player2].forEach((p) => {
+        add(p.x); add(p.y); add(p.vx); add(p.vy); add(p.health); add(p.ki);
+        add(p.awakenMeter); add(p.invulnerableFrames); add(p.attackTimer);
+    });
+    add(projectiles.length);
+    projectiles.forEach((p) => add(p.x));
+    add(time);
+    return h | 0;
+}
+function compareHash(f) {
+    if (!net.myHash.has(f) || !net.peerHash.has(f)) return;
+    if (net.myHash.get(f) !== net.peerHash.get(f)) {
+        net.desync = true;
+        console.warn('[net] DESINCRONIZACIÓN detectada en el frame', f);
+        setNetInfo('⚠ DESINCRONIZADO (frame ' + f + ')', true);
+    }
+    net.myHash.delete(f); net.peerHash.delete(f);
+}
+
+// Se llama al terminar cada paso de simulación online.
+function onlineAfterStep() {
+    net.frame++;
+    if (net.frame % 60 === 0) {
+        // El cronómetro cuenta frames simulados (no tiempo real) → idéntico en ambos clientes.
+        onlineTimerTick();
+        if (gameRunning) {
+            const h = stateHash();
+            net.myHash.set(net.frame, h);
+            netSend({ t: 'chk', f: net.frame, h });
+            compareHash(net.frame);
+        }
+    }
+}
+
+// Aplica el input (bitmask) de un frame a un luchador. Misma función para AMBOS jugadores.
+function applyInputTo(fighter, m) {
     const left = (m & 1) !== 0, right = (m & 2) !== 0, up = (m & 4) !== 0;
     const down = (m & 8) !== 0, charge = (m & 16) !== 0, attack = (m & 32) !== 0;
 
@@ -576,21 +691,19 @@ function applyRemoteTo(fighter) {
     } else { fighter.isBlocking = false; fighter.isCharging = false; }
 
     if (fighter.isFlying && !fighter.isDashing && !fighter.isCharging) {
-        if (up) fighter.vy = -4.5; if (down) fighter.vy = 4.5;
+        if (up) fighter.vy = -4.5;
+        if (down) fighter.vy = 4.5;
     } else if (!fighter.isDashing && !fighter.isCharging) {
-        if (up && fighter.isGrounded && !fighter.isBlocking) { fighter.vy = fighter.jumpStrength; }
+        if (up && fighter.isGrounded && !fighter.isBlocking) { fighter.vy = fighter.jumpStrength; playSound('jump'); }
     }
 
+    if (m & ACT.fly) fighter.toggleFly();
     if (attack) fighter.attack();
-
-    while (net.actionQueue.length) {
-        const a = net.actionQueue.shift();
-        if (a === 'ki') fighter.shootKi(projectiles, false);
-        else if (a === 'ult') fighter.shootKi(projectiles, true);
-        else if (a === 'fly') fighter.toggleFly();
-        else if (a === 'awaken') fighter.activateAwaken();
-        else if (a === 'dashL') fighter.triggerDash(-1);
-        else if (a === 'dashR') fighter.triggerDash(1);
+    if (m & ACT.ki) fighter.shootKi(projectiles, false);
+    if (m & ACT.ult) fighter.shootKi(projectiles, true);
+    if (m & ACT.awaken) fighter.activateAwaken();
+    if ((m & (ACT.dashL | ACT.dashR)) && !fighter.isBlocking && !fighter.isDashing && !fighter.isCharging) {
+        fighter.triggerDash((m & ACT.dashL) ? -1 : 1);
     }
 }
 
@@ -725,7 +838,12 @@ function connectAndDo(action) {
         mySide: null, mode: pendingMode, want: action, gotRoom: false,
         joinCode: (document.getElementById('join-code').value || '').toUpperCase().trim(),
         oppName: '', oppRank: '', oppChar: null,
-        remoteHeld: 0, actionQueue: [], lastSentMask: -1, endSent: false,
+        endSent: false,
+        // --- lockstep ---
+        delay: 6, seed: null, rtt: 0, pingTimer: null,
+        frame: 0, nextSend: 0, pendingActs: 0, stallSince: 0, desync: false,
+        localIn: new Map(), remoteIn: new Map(), myHash: new Map(), peerHash: new Map(),
+        lastTap: { key: '', time: 0 },
     };
     const ws = net.ws;
     ws.onopen = () => { if (net) { netSend({ t: 'auth', token }); updateOnlineStatus(); } };
@@ -750,6 +868,7 @@ function handleNet(msg) {
             if (!net) return;
             setOnlinePanel('waiting');
             updateOnlineStatus();
+            startPing();
             if (net.want === 'create') netSend({ t: 'create', mode: net.mode });
             else netSend({ t: 'join', code: net.joinCode });
             break;
@@ -771,12 +890,23 @@ function handleNet(msg) {
             break;
         case 'start':
             net.mySide = msg.side; net.mode = msg.mode;
+            net.delay = Math.min(16, Math.max(3, (msg.delay | 0) || 6));
+            net.seed = Number.isInteger(msg.seed) ? msg.seed : null;
             applyOpponent(msg.opponent);
             launchOnlineMatch();
             break;
         case 'hb': break;
-        case 'in': net.remoteHeld = msg.m; break;
-        case 'act': net.actionQueue.push(msg.a); break;
+        case 'in':
+            if (Number.isInteger(msg.f) && Number.isInteger(msg.m)) net.remoteIn.set(msg.f, msg.m);
+            break;
+        case 'chk':
+            if (Number.isInteger(msg.f)) { net.peerHash.set(msg.f, msg.h); compareHash(msg.f); }
+            break;
+        case 'pong': {
+            const r = performance.now() - msg.ts;
+            if (r >= 0 && r < 5000) net.rtt = net.rtt ? net.rtt * 0.6 + r * 0.4 : r;
+            break;
+        }
         case 'ranked_result': handleRankedResult(msg); break;
         case 'opponent_left':
             if (gameMode === 'online') endOnlineAborted('RIVAL DESCONECTADO — PARTIDA ANULADA');
@@ -812,7 +942,7 @@ function buildOnlineRoster() {
 }
 function sendReady() {
     if (!sessionUser || !net) return;
-    netSend({ t: 'ready', char: ROSTER[myOnlineChar] ? myOnlineChar : 'goku' });
+    netSend({ t: 'ready', char: ROSTER[myOnlineChar] ? myOnlineChar : 'goku', rtt: Math.round(net.rtt || 100) });
     myReadySent = true;
     const btn = document.getElementById('ol-listobtn'); if (btn) btn.disabled = true;
     showOnlineMsg('LISTO ✔ — esperando a tu rival…', true);
@@ -822,6 +952,7 @@ function launchOnlineMatch() {
     const oppChar = (net.oppChar && ROSTER[net.oppChar]) ? net.oppChar : 'goku';
     gameMode = 'online';
     document.getElementById('online-overlay').style.display = 'none';
+    onlineBeginSim();
     startMatch(net.mySide === 'p1' ? myChar : oppChar, net.mySide === 'p1' ? oppChar : myChar);
 }
 function handleRankedResult(msg) {
@@ -850,6 +981,8 @@ function endOnlineAborted(msg) {
 }
 function handleNetClose() {
     if (!net) return;
+    if (net.pingTimer) clearInterval(net.pingTimer);
+    setNetInfo(null);
     const inMatch = gameMode === 'online';
     endOnlineAborted(inMatch ? 'CONEXIÓN PERDIDA — PARTIDA ANULADA' : 'Se cerró la conexión con el servidor.');
     updateOnlineStatus();
@@ -857,6 +990,8 @@ function handleNetClose() {
     net = null;
 }
 function netCleanup() {
+    if (net && net.pingTimer) clearInterval(net.pingTimer);
+    setNetInfo(null);
     if (net && net.ws) {
         const old = net.ws;
         old.onmessage = null; old.onclose = null; old.onerror = null;
@@ -1017,19 +1152,22 @@ window.addEventListener('keydown', (e) => {
     if (inField) return; // no capturar teclas mientras se escribe en un campo
     if (e.code === 'Escape' && gameRunning && gameMode !== 'online') { togglePause(); e.preventDefault(); return; }
     if (e.code === 'KeyM') { toggleMute(); return; }
+    if (gameMode === 'online' && net && gameRunning) {
+        if (!keys[e.code]) queueOnlineKey(e.code);
+        keys[e.code] = true;
+        return;
+    }
     if (!keys[e.code] && gameRunning) {
         const now = Date.now();
-        if ((e.code === 'KeyA' || e.code === 'KeyD') && !isRemote(1)) {
+        if ((e.code === 'KeyA' || e.code === 'KeyD')) {
             if (lastTap.p1.key === e.code && now - lastTap.p1.time < 220 && !player1.isBlocking && !player1.isDashing && !player1.isCharging) {
                 player1.triggerDash(e.code === 'KeyA' ? -1 : 1);
-                sendAct(e.code === 'KeyA' ? 'dashL' : 'dashR');
             }
             lastTap.p1 = { key: e.code, time: now };
         }
-        if ((e.code === 'ArrowLeft' || e.code === 'ArrowRight') && gameMode !== 'bot' && !isRemote(2)) {
+        if ((e.code === 'ArrowLeft' || e.code === 'ArrowRight') && gameMode !== 'bot') {
             if (lastTap.p2.key === e.code && now - lastTap.p2.time < 220 && !player2.isBlocking && !player2.isDashing && !player2.isCharging) {
                 player2.triggerDash(e.code === 'ArrowLeft' ? -1 : 1);
-                sendAct(e.code === 'ArrowLeft' ? 'dashL' : 'dashR');
             }
             lastTap.p2 = { key: e.code, time: now };
         }
@@ -2199,7 +2337,11 @@ function startMatch(p1Char, p2Char) {
     document.getElementById('hud').style.display = 'flex';
     document.getElementById('result-display').style.display = 'none';
 
-    if (selectedStage === 'random') {
+    if (gameMode === 'online' && net && Number.isInteger(net.seed)) {
+        // mismo escenario en ambos clientes (semilla enviada por el servidor)
+        const pool = Object.keys(STAGES).filter(k => k !== 'random');
+        currentStageKey = pool[net.seed % pool.length];
+    } else if (selectedStage === 'random') {
         const pool = Object.keys(STAGES).filter(k => k !== 'random');
         currentStageKey = pool[Math.floor(Math.random() * pool.length)];
     } else {
@@ -2258,7 +2400,9 @@ function startMatch(p1Char, p2Char) {
 
     runCountdown(() => {
         gameRunning = true;
-        timerInterval = setInterval(() => {
+        frameAcc = STEP_MS; lastFrameT = performance.now();
+        // En online el cronómetro lo lleva onlineTimerTick() contando frames simulados.
+        if (gameMode !== 'online') timerInterval = setInterval(() => {
             if (time > 0 && gameRunning) {
                 time--; timerEl.innerText = time;
                 if (time <= 10) timerEl.classList.add('timer-low'); else timerEl.classList.remove('timer-low');
@@ -2271,6 +2415,18 @@ function startMatch(p1Char, p2Char) {
         }, 1000);
         animate();
     });
+}
+
+function onlineTimerTick() {
+    const timerEl = document.getElementById('timer');
+    if (time > 0) {
+        time--; timerEl.innerText = time;
+        if (time <= 10) timerEl.classList.add('timer-low'); else timerEl.classList.remove('timer-low');
+    } else if (time === 0) {
+        if (player1.health === player2.health) endGame('¡TIME OVER — EMPATE!', 'draw');
+        else if (player1.health > player2.health) endGame(`¡TIME OVER — ${player1.name.toUpperCase()} GANA!`, 'p1');
+        else endGame(`¡TIME OVER — ${player2.name.toUpperCase()} GANA!`, 'p2');
+    }
 }
 
 function runCountdown(onFinish) {
@@ -2790,10 +2946,26 @@ function handleCollisions() {
     }
 }
 
+let lastFrameT = 0, frameAcc = 0;
 function animate() {
     if (!gameRunning) return;
     if (paused) return; // bucle congelado: no se pide el siguiente frame
     requestAnimationFrame(animate);
+
+    // Paso fijo de 60 Hz: un monitor de 120/144 Hz ya NO hace correr el juego más rápido.
+    const nowT = performance.now();
+    frameAcc += Math.min(nowT - lastFrameT, 100); lastFrameT = nowT;
+    if (frameAcc < STEP_MS - 0.75) return;
+    frameAcc -= STEP_MS;
+    if (frameAcc > STEP_MS * 2) frameAcc = STEP_MS * 2;
+
+    // Online: solo avanzamos si ya tenemos los inputs de ESTE frame de ambos jugadores.
+    let onlineIn = null;
+    if (gameMode === 'online') {
+        if (!net) return;
+        onlineIn = onlineFrameInputs();
+        if (!onlineIn) return;
+    }
 
     ctx.save();
     if (screenShake > 0.5) { ctx.translate((Math.random() - 0.5) * screenShake, (Math.random() - 0.5) * screenShake); screenShake *= 0.88; }
@@ -2813,8 +2985,9 @@ function animate() {
 
     updateAwakenHUD(player1, 'p1'); updateAwakenHUD(player2, 'p2');
 
-    if (isRemote(1)) {
-        applyRemoteTo(player1);
+    if (gameMode === 'online') {
+        applyInputTo(player1, onlineIn.m1);
+        applyInputTo(player2, onlineIn.m2);
     } else {
         if (!player1.isDashing) {
             player1.vx = 0; player1.isBlocking = keys['KeyS']; player1.isCharging = keys['KeyC'] && !player1.isBlocking;
@@ -2832,17 +3005,17 @@ function animate() {
             if (keys['KeyW'] && player1.isGrounded && !player1.isBlocking) { player1.vy = player1.jumpStrength; playSound('jump'); }
         }
 
-        handleSinglePress('KeyR', () => { player1.toggleFly(); sendAct('fly'); });
+        handleSinglePress('KeyR', () => { player1.toggleFly(); });
         if (keys['KeyF']) player1.attack();
-        handleSinglePress('KeyE', () => { player1.shootKi(projectiles, false); sendAct('ki'); });
-        handleSinglePress('KeyQ', () => { player1.shootKi(projectiles, true); sendAct('ult'); });
-        handleSinglePress('KeyT', () => { player1.activateAwaken(); sendAct('awaken'); });
+        handleSinglePress('KeyE', () => { player1.shootKi(projectiles, false); });
+        handleSinglePress('KeyQ', () => { player1.shootKi(projectiles, true); });
+        handleSinglePress('KeyT', () => { player1.activateAwaken(); });
     }
 
     if (gameMode === 'bot') {
         runBotAI();
-    } else if (isRemote(2)) {
-        applyRemoteTo(player2);
+    } else if (gameMode === 'online') {
+        // ya aplicado arriba con los inputs sincronizados
     } else {
         if (!player2.isDashing) {
             player2.vx = 0; player2.isBlocking = keys['ArrowDown']; player2.isCharging = keys['KeyI'] && !player2.isBlocking;
@@ -2860,14 +3033,12 @@ function animate() {
             if (keys['ArrowUp'] && player2.isGrounded && !player2.isBlocking) { player2.vy = player2.jumpStrength; playSound('jump'); }
         }
 
-        handleSinglePress('KeyO', () => { player2.toggleFly(); sendAct('fly'); });
+        handleSinglePress('KeyO', () => { player2.toggleFly(); });
         if (keys['KeyK']) player2.attack();
-        handleSinglePress('KeyL', () => { player2.shootKi(projectiles, false); sendAct('ki'); });
-        handleSinglePress('KeyU', () => { player2.shootKi(projectiles, true); sendAct('ult'); });
-        handleSinglePress('KeyP', () => { player2.activateAwaken(); sendAct('awaken'); });
+        handleSinglePress('KeyL', () => { player2.shootKi(projectiles, false); });
+        handleSinglePress('KeyU', () => { player2.shootKi(projectiles, true); });
+        handleSinglePress('KeyP', () => { player2.activateAwaken(); });
     }
-
-    sendIn();
 
     handleCollisions(); drawCombos();
 
@@ -2881,6 +3052,8 @@ function animate() {
         else if (player2.health <= 0) endGame(`¡${player1.name.toUpperCase()} GANA!`, 'p1');
         else endGame(`¡${player2.name.toUpperCase()} GANA!`, 'p2');
     }
+
+    if (gameMode === 'online' && gameRunning) onlineAfterStep();
 }
 
 // ==== Escala para pantallas pequeñas ====

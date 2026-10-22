@@ -411,7 +411,7 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin 0/O/1/I
 const ROOM_CODE_LEN = 6;
 
 function setupWebSocket(httpServer) {
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws', perMessageDeflate: false, maxPayload: 4096 });
   const HEARTBEAT_INTERVAL = 25000;
   let heartbeatInterval;
 
@@ -445,7 +445,9 @@ function setupWebSocket(httpServer) {
     if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
   };
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    // Desactiva Nagle: los inputs son paquetes diminutos y no deben esperar para enviarse.
+    try { req.socket.setNoDelay(true); } catch (e) { /* ignore */ }
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
     ws.user = null; // { usernameKey, username, pub }
@@ -482,6 +484,8 @@ function setupWebSocket(httpServer) {
         return send(ws, { t: 'authed', user: ws.user.pub });
       }
 
+      if (msg.t === 'ping') return send(ws, { t: 'pong', ts: msg.ts });
+
       if (!ws.user) return send(ws, { t: 'err', msg: 'Autentícate primero.' });
 
       // ---- Crear sala ----
@@ -498,6 +502,8 @@ function setupWebSocket(httpServer) {
           readyCount: 0,
           hostChar: null,
           guestChar: null,
+          hostRtt: 100,
+          guestRtt: 100,
           started: false,
           recorded: false,
         };
@@ -533,41 +539,49 @@ function setupWebSocket(httpServer) {
         if (!room.guest || room.started) return send(ws, { t: 'err', msg: 'Aún no se puede listo.' });
         const char = typeof msg.char === 'string' && msg.char.trim() ? msg.char.trim().slice(0, 24) : null;
         if (!char) return send(ws, { t: 'err', msg: 'Selecciona un personaje.' });
+        const rtt = Math.min(2000, Math.max(0, Number(msg.rtt) || 100));
         if (ws === room.host && !room.hostChar) {
           room.hostChar = char;
+          room.hostRtt = rtt;
           room.readyCount++;
         } else if (ws === room.guest && !room.guestChar) {
           room.guestChar = char;
+          room.guestRtt = rtt;
           room.readyCount++;
         } else {
           return send(ws, { t: 'err', msg: 'Ya enviaste tu personaje.' });
         }
         if (room.readyCount === 2) {
           room.started = true;
+          // Latencia de un jugador al otro ≈ (rttHost + rttGuest) / 2. Delay de inputs en frames
+          // (a 60 fps) con 2 frames de margen para el jitter; el MISMO valor para los dos.
+          const oneWayMs = (room.hostRtt + room.guestRtt) / 2;
+          const delay = Math.min(16, Math.max(4, Math.ceil(oneWayMs / (1000 / 60)) + 2));
+          const seed = crypto.randomInt(0, 1000000); // escenario idéntico en ambos clientes
           const oppForHost = { ...room.guest.user.pub, char: room.guestChar };
           const oppForGuest = { ...room.host.user.pub, char: room.hostChar };
-          send(room.host, { t: 'start', mode: room.mode, side: 'p1', self: room.host.user.pub, opponent: oppForHost });
-          send(room.guest, { t: 'start', mode: room.mode, side: 'p2', self: room.guest.user.pub, opponent: oppForGuest });
+          send(room.host, { t: 'start', mode: room.mode, side: 'p1', self: room.host.user.pub, opponent: oppForHost, delay, seed });
+          send(room.guest, { t: 'start', mode: room.mode, side: 'p2', self: room.guest.user.pub, opponent: oppForGuest, delay, seed });
         }
         return;
       }
 
-      // ---- Relay de inputs (solo durante la partida) ----
-      if (msg.t === 'in' || msg.t === 'act') {
+      // ---- Relay de inputs (lockstep): {f: frame, m: máscara de teclas+acciones} ----
+      if (msg.t === 'in') {
         if (!room || !room.started || !room.guest) return;
+        const f = msg.f, m = msg.m;
+        if (!Number.isInteger(f) || f < 0 || f > 10000000) return send(ws, { t: 'err', msg: 'Frame inválido.' });
+        if (!Number.isInteger(m) || m < 0 || m > 0xffff) return send(ws, { t: 'err', msg: 'Input inválido.' });
         const peer = ws === room.host ? room.guest : room.host;
-        const relayed = { t: msg.t };
-        if (msg.t === 'in') {
-          const m = Number(msg.m);
-          if (!Number.isInteger(m) || m < 0 || m > 0xffff) return send(ws, { t: 'err', msg: 'Input inválido.' });
-          relayed.m = m;
-        } else {
-          if (!['ki', 'ult', 'fly', 'awaken', 'dashL', 'dashR'].includes(msg.a)) {
-            return send(ws, { t: 'err', msg: 'Acción inválida.' });
-          }
-          relayed.a = msg.a;
-        }
-        return send(peer, relayed);
+        return send(peer, { t: 'in', f, m });
+      }
+
+      // ---- Checksum del estado (detección de desincronización) ----
+      if (msg.t === 'chk') {
+        if (!room || !room.started || !room.guest) return;
+        if (!Number.isInteger(msg.f) || !Number.isInteger(msg.h)) return;
+        const peer = ws === room.host ? room.guest : room.host;
+        return send(peer, { t: 'chk', f: msg.f, h: msg.h });
       }
 
       // ---- Resultado (solo el host registra) ----
